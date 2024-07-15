@@ -1,1 +1,1 @@
-一个通用的代理工具。
+A generic proxy tool for btc and ltc miner.
