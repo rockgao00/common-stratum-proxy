@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -12,10 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-)
-
-var (
-	configPath = flag.String("config", "config.json", "Path to JSON configuration file")
+	"time"
 )
 
 type MinerConfig struct {
@@ -25,18 +23,14 @@ type MinerConfig struct {
 }
 
 type Config struct {
-	Listen  string      `json:"listen"`
-	Targets []string    `json:"targets"`
-	Miner   MinerConfig `json:"miner"`
+	Listen     string      `json:"listen"`
+	BTCTargets []string    `json:"btc_targets"`
+	LTCTargets []string    `json:"ltc_targets"`
+	Miner      MinerConfig `json:"miner"`
 }
 
 func getClientIP(conn net.Conn) string {
-	clientAddr := conn.RemoteAddr().String()
-	clientIP, _, err := net.SplitHostPort(clientAddr)
-	if err != nil {
-		log.Println("Error parsing client address:", err)
-		return ""
-	}
+	clientIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
 	formattedIP := strings.ReplaceAll(clientIP, ".", "x")
 	return formattedIP
 }
@@ -83,21 +77,45 @@ func ModifyJSON(data string, config *Config, ip string) string {
 	return data
 }
 
+func checkPort(ip string, port int) bool {
+	address := fmt.Sprintf("%s:%d", ip, port)
+	timeout := time.Second * 2
+	conn, err := net.DialTimeout("tcp", address, timeout)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
 func HandleClient(clientConn net.Conn, config *Config, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer clientConn.Close()
 
-	remoteConn, err := net.Dial("tcp", config.Targets[0])
-	if err != nil {
-		log.Printf("Failed to connect to remote server 0: %v", err)
-		remoteConn, err = net.Dial("tcp", config.Targets[1])
-		if err != nil {
-			log.Printf("Failed to connect to remote server 1: %v", err)
-			return
-		}
+	var targets []string
+	if true == checkPort(clientConn.RemoteAddr().(*net.TCPAddr).IP.String(), 8359) {
+		targets = config.LTCTargets
+	} else if true == checkPort(clientConn.RemoteAddr().(*net.TCPAddr).IP.String(), 4028) {
+		targets = config.BTCTargets
+	} else {
+		targets = config.LTCTargets
 	}
 
+	var remoteConn net.Conn
+	var err error
+	for index := 0; index < len(targets); index++ {
+		remoteConn, err = net.Dial("tcp", targets[index])
+		if err != nil {
+			continue
+		} else {
+			break
+		}
+	}
 	defer remoteConn.Close()
+	if err != nil {
+		log.Printf("Failed to connect to all remote server")
+		return
+	}
 
 	clientReader := bufio.NewReader(clientConn)
 	remoteReader := bufio.NewReader(remoteConn)
@@ -147,7 +165,12 @@ func HandleClient(clientConn net.Conn, config *Config, wg *sync.WaitGroup) {
 }
 
 func StartProxy(config *Config) {
-	listener, err := net.Listen("tcp", config.Listen)
+	tcpAddr, err := net.ResolveTCPAddr("tcp", config.Listen)
+	if err != nil {
+		log.Fatalf("Failed to resolve TCP address: %v", err)
+	}
+
+	listener, err := net.ListenTCP("tcp", tcpAddr)
 	if err != nil {
 		log.Fatalf("Failed to start proxy server: %v", err)
 	}
@@ -164,28 +187,28 @@ func StartProxy(config *Config) {
 
 	go func() {
 		for {
-			clientConn, err := listener.Accept()
-			if err != nil {
-				select {
-				case <-stopChan: // Listener closed, exit goroutine
-					return
-				default:
-					log.Printf("Failed to accept connection: %v", err)
+			select {
+			case <-stopChan: // Stop accepting new connections
+				return
+			default:
+				// Set a timeout on Accept to check the stopChan periodically
+				//listener.SetDeadline(time.Now().Add(1 * time.Second))
+				clientConn, err := listener.Accept()
+				if err != nil {
 					continue
 				}
-			}
 
-			log.Printf("Accepted connection from %s", clientConn.RemoteAddr().String())
-			wg.Add(1)
-			go HandleClient(clientConn, config, &wg)
+				//log.Printf("Accepted connection from %s", clientConn.RemoteAddr().String())
+				wg.Add(1)
+				go HandleClient(clientConn, config, &wg)
+			}
 		}
 	}()
 
 	<-sigChan
 	close(stopChan)
 	listener.Close()
-
-	wg.Wait()
+	//wg.Wait()
 	log.Println("Proxy server stopped")
 }
 
@@ -205,7 +228,11 @@ func loadConfig(path string) (*Config, error) {
 }
 
 func main() {
-	logFile, err := os.OpenFile("./app.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+	configPath := flag.String("c", "config.json", "Path to JSON configuration file")
+	logPath := flag.String("l", "", "Path to log configuration file")
+	flag.Parse()
+
+	logFile, err := os.OpenFile(*logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
 	}
@@ -217,16 +244,16 @@ func main() {
 	}(logFile)
 
 	log.SetOutput(logFile)
-	flag.Parse()
 
 	config, err := loadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("Error loading config: %v", err)
 	}
 
-	if len(config.Targets) == 0 {
-		log.Fatal("No target addresses specified in config")
+	if (len(config.BTCTargets) == 0 && len(config.LTCTargets) == 0) || len(config.Miner.Auth) == 0 {
+		log.Fatal("No target addresses specified in config or auth is null")
 	}
 
+	log.Printf("Proxy server start")
 	StartProxy(config)
 }
